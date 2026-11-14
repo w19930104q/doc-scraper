@@ -40,6 +40,13 @@ jsonl_output_filename: "pages.jsonl"
 # Incremental crawling (skip unchanged pages)
 # enable_incremental: false
 
+# Sitemap lastmod incremental mode (off by default). When on, URLs whose
+# sitemap lastmod is older than the last successful crawl are not downloaded
+# and are counted unchanged; missing, malformed, or future-dated lastmod
+# values always fall through to a normal fetch. Needs state_dir/index.db
+# history from a previous crawl and works alongside enable_incremental.
+# enable_sitemap_incremental: false
+
 # HTTP client settings (only the three knobs real users tune are exposed;
 # pool, dialer, and TLS timings are baked into pkg/fetch with sane defaults).
 http_client_settings:

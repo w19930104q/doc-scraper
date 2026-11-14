@@ -293,6 +293,7 @@ func (c *Crawler) Run(resume bool) (err error) {
 		}
 		c.carry = cf
 	}
+	c.configureSitemapIncremental(runLog)
 
 	initialTasksFromDB, err := c.requeueIncomplete(resume, runLog)
 	if err != nil {
@@ -509,6 +510,52 @@ func (c *Crawler) prepareOutputDir(resume bool, runLog *slog.Logger) error {
 	}
 	runLog.Info(fmt.Sprintf("Ensured site output directory exists: %s", c.siteOutputDir))
 	return nil
+}
+
+// configureSitemapIncremental arms the sitemap processor's lastmod skip rule
+// when sitemap incremental mode is enabled. The cutoff is the end of the most
+// recent recorded crawl: anything the sitemap still marks as unchanged at that
+// time need not be downloaded. Without a history index or a recorded crawl the
+// mode stays inert so a first run behaves exactly like a normal crawl.
+func (c *Crawler) configureSitemapIncremental(runLog *slog.Logger) {
+	if !c.appCfg.EnableSitemapIncremental {
+		return
+	}
+	if c.idx == nil {
+		runLog.Info("Sitemap incremental mode requested but no crawl-history index is attached; fetching every page")
+		return
+	}
+	latest, err := c.idx.GetLatestCrawl(c.crawlCtx, c.siteKey)
+	if err != nil {
+		runLog.Warn("Sitemap incremental mode could not read the last crawl; fetching every page", "err", err)
+		return
+	}
+	if latest == nil {
+		runLog.Info("Sitemap incremental mode has no previous crawl to compare against; fetching every page")
+		return
+	}
+	cutoff := latest.CrawlEndedAt.UTC()
+	runLog.Info("Sitemap incremental mode enabled; pages older than the last successful crawl are skipped",
+		"cutoff", cutoff.Format(time.RFC3339))
+	c.sitemapProcessor.ConfigureIncremental(cutoff, c.noteSitemapUnchanged)
+}
+
+// noteSitemapUnchanged folds a lastmod-skipped sitemap page into the same
+// accounting and corpus-preservation paths a hash-skipped page uses: it counts
+// as unchanged for progress and the shrink checks, and in a staged crawl its
+// previous corpus copy is marked for carry-forward so publishing the new
+// corpus cannot silently drop it.
+func (c *Crawler) noteSitemapUnchanged(normalizedURL string) {
+	c.unchangedCounter.Add(1)
+	if c.carry == nil {
+		return
+	}
+	u, err := url.Parse(normalizedURL)
+	if err != nil {
+		c.log.Warn("Sitemap-skipped page could not be marked for carry-forward", "url", normalizedURL, "err", err)
+		return
+	}
+	c.carry.note(u)
 }
 
 // requeueIncomplete, on a resume, scans the store for incomplete tasks and adds

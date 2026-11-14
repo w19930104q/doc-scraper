@@ -52,6 +52,11 @@ type AppConfig struct {
 	EnableJSONLOutput   *bool                  `yaml:"enable_jsonl_output,omitempty"` // nil = on; search and history are built from it
 	JSONLOutputFilename string                 `yaml:"jsonl_output_filename,omitempty"`
 	EnableIncremental   bool                   `yaml:"enable_incremental,omitempty"`
+	// EnableSitemapIncremental skips downloading pages whose sitemap lastmod is
+	// older than the last successful crawl. Missing, malformed, or future-dated
+	// lastmod values always fall through to a normal fetch. Off by default; the
+	// crawl-history index (state_dir/index.db) must exist for it to take effect.
+	EnableSitemapIncremental bool `yaml:"enable_sitemap_incremental,omitempty"`
 	// CrawlHistoryRetention is the number of past crawls per site kept in the
 	// SQLite history index (state_dir/index.db) that powers get_freshness and
 	// diff_crawl. Anything older is pruned at write time. 0 means use the

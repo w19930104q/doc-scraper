@@ -94,6 +94,7 @@ sites:
 | `enable_jsonl_output` | Boolean | Enable JSONL page output (one record per page plus a trailing crawl_meta record) for RAG pipelines. The search index (`search`, `search_docs`), crawl history (`get_freshness`, `diff_crawl`), and `llms.txt` are built from this file, so setting it to `false` turns those off, and the next crawl of a site removes its earlier index data | `true` |
 | `jsonl_output_filename` | String | Filename for JSONL output | `"pages.jsonl"` |
 | `enable_incremental` | Boolean | Enable incremental crawling globally | `false` |
+| `enable_sitemap_incremental` | Boolean | Skip downloading sitemap URLs whose `lastmod` is not newer than the end of the last successful crawl; skipped URLs are counted as unchanged and republished from the previous corpus. Missing, malformed, or future-dated `lastmod` values always fall through to a normal fetch, and the rule is applied recursively to sitemap indexes and sub-sitemaps. Requires the crawl-history index (`state_dir/index.db`); without a previous successful crawl the run behaves like a full fetch. Independent of `enable_incremental` | `false` |
 | `crawl_history_retention` | Integer | Number of past crawls per site kept in the SQLite history index (powers `get_freshness`/`diff_crawl`) | `10` |
 | `http_client_settings` | Object | HTTP client configuration, see [HTTP client settings](#http-client-settings) | |
 | `sites` | Map | Site-specific configurations keyed by site key, see [Site options](#site-options) | required |

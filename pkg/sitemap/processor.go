@@ -15,6 +15,8 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/semaphore"
 
@@ -57,6 +59,20 @@ type SitemapProcessor struct {
 	sitemapsProcessedMu        sync.Mutex
 	sitemapLimitLogged         bool
 	backlog                    *sitemapBacklog
+
+	// Sitemap incremental mode. When enabled and lastSuccess is set, a page
+	// whose lastmod parses to a time no newer than lastSuccess is skipped
+	// without a download and reported through onUnchanged. Configured per run
+	// with ConfigureIncremental rather than through the constructor so existing
+	// call sites and tests keep working.
+	incremental bool
+	lastSuccess time.Time
+	now         func() time.Time
+	// onUnchanged, if set, is invoked once for every page skipped by the
+	// lastmod rule; the crawler uses it to tally unchanged and carry the
+	// skipped page's previous corpus copy into a staged output.
+	onUnchanged func(normalizedURL string)
+	unchanged   atomic.Int64
 }
 
 func NewSitemapProcessor(
@@ -95,6 +111,25 @@ func NewSitemapProcessor(
 func (sp *SitemapProcessor) Start(ctx context.Context) {
 	sp.log.Info("Sitemap processing goroutine starting.")
 	go sp.run(ctx)
+}
+
+// ConfigureIncremental turns on sitemap-based incremental skipping for one
+// crawl. lastSuccess is the end of the previous successful crawl: a page whose
+// lastmod is at or before it can be reused without a download. A zero
+// lastSuccess (no recorded history, or a disabled history index) leaves the
+// processor in normal mode. onUnchanged, if non-nil, receives each skipped
+// page's normalized URL.
+func (sp *SitemapProcessor) ConfigureIncremental(lastSuccess time.Time, onUnchanged func(normalizedURL string)) {
+	sp.incremental = true
+	sp.lastSuccess = lastSuccess.UTC()
+	sp.now = func() time.Time { return time.Now().UTC() }
+	sp.onUnchanged = onUnchanged
+}
+
+// UnchangedCount reports how many pages were skipped through the lastmod rule
+// since the processor was created.
+func (sp *SitemapProcessor) UnchangedCount() int64 {
+	return sp.unchanged.Load()
 }
 
 // MarkSitemapProcessed marks a sitemap URL as queued. It returns true if newly
@@ -433,6 +468,13 @@ func readSitemapBody(body io.Reader) ([]byte, error) {
 
 // handleSitemapIndex queues each valid, not-yet-seen nested sitemap of an
 // index found at depth onto the backlog for the worker pool to process.
+//
+// An index entry's lastmod only describes when the nested sitemap document
+// itself changed, so it cannot be used to skip that fetch safely: a child
+// sitemap can gain or lose URLs without the index's lastmod moving, and the
+// pages it lists would then vanish from the crawl. The lastmod rule therefore
+// applies to page entries in handleURLSet, recursively, for every urlset the
+// index reaches; malformed index-level lastmod values are logged and ignored.
 func (sp *SitemapProcessor) handleSitemapIndex(index parse.XMLSitemapIndex, depth int, backlog *sitemapBacklog, sitemapLog *slog.Logger) {
 	sitemapLog.Info(fmt.Sprintf("Parsed as Sitemap Index, found %d references.", len(index.Sitemaps)))
 	if depth >= maxSitemapIndexDepth {
@@ -446,6 +488,13 @@ func (sp *SitemapProcessor) handleSitemapIndex(index parse.XMLSitemapIndex, dept
 		if _, nestedErr := url.ParseRequestURI(nestedSmURL); nestedErr != nil {
 			nestedSmLog.Warn(fmt.Sprintf("Invalid nested sitemap URL: %v", nestedErr))
 			continue
+		}
+		if sp.incremental && sitemapEntry.LastMod != "" {
+			if t, err := parse.ParseSitemapLastMod(sitemapEntry.LastMod); err != nil {
+				nestedSmLog.Debug(fmt.Sprintf("Nested sitemap has an unparseable lastmod; fetching it anyway: %v", err))
+			} else {
+				nestedSmLog.Debug("Nested sitemap lastmod parsed; fetching it so its current URL list is never assumed stale", "lastmod", t)
+			}
 		}
 		if !sp.MarkSitemapProcessed(nestedSmURL) {
 			nestedSmLog.Debug(fmt.Sprintf("Nested sitemap already processed/queued: %s", nestedSmURL))
@@ -471,6 +520,7 @@ func (sp *SitemapProcessor) handleURLSet(urlSet parse.XMLURLSet, sitemapLog *slo
 		return
 	}
 	queuedCount := 0
+	skippedCount := 0
 	dbErrorCount := 0
 	for _, urlEntry := range urlSet.URLs {
 		pageURL := urlEntry.Loc
@@ -482,6 +532,15 @@ func (sp *SitemapProcessor) handleURLSet(urlSet parse.XMLURLSet, sitemapLog *slo
 
 		normalizedPageURL, ok := sp.normalizeInScopeURL(pageURL, sitemapLog)
 		if !ok {
+			continue
+		}
+
+		if sp.shouldSkipForLastMod(urlEntry.LastMod, pageURL, sitemapLog) {
+			skippedCount++
+			sp.unchanged.Add(1)
+			if sp.onUnchanged != nil {
+				sp.onUnchanged(normalizedPageURL)
+			}
 			continue
 		}
 
@@ -497,11 +556,48 @@ func (sp *SitemapProcessor) handleURLSet(urlSet parse.XMLURLSet, sitemapLog *slo
 		}
 	}
 
-	if dbErrorCount > 0 {
-		sitemapLog.Warn(fmt.Sprintf("Finished URL Set. Queued %d new URLs, encountered %d DB errors.", queuedCount, dbErrorCount))
-	} else {
+	switch {
+	case dbErrorCount > 0:
+		sitemapLog.Warn(fmt.Sprintf("Finished URL Set. Queued %d new URLs, skipped %d unchanged URLs, encountered %d DB errors.", queuedCount, skippedCount, dbErrorCount))
+	case skippedCount > 0:
+		sitemapLog.Info(fmt.Sprintf("Finished URL Set. Queued %d new URLs, skipped %d unchanged URLs by lastmod.", queuedCount, skippedCount))
+	default:
 		sitemapLog.Info(fmt.Sprintf("Finished URL Set. Queued %d new URLs.", queuedCount))
 	}
+}
+
+// shouldSkipForLastMod decides whether a sitemap page can be reused from the
+// previous crawl without a download. It only returns true when every part of
+// the signal is trustworthy: incremental mode is on with a known previous
+// crawl time, the lastmod parses, it is not in the future (a clock-skewed or
+// hand-edited sitemap cannot prove freshness either way), and it is at or
+// before the last successful crawl. A missing or malformed lastmod, a future
+// timestamp, or any other uncertainty means the page is fetched normally.
+func (sp *SitemapProcessor) shouldSkipForLastMod(lastMod, pageURL string, sitemapLog *slog.Logger) bool {
+	if !sp.incremental || sp.lastSuccess.IsZero() {
+		return false
+	}
+	if strings.TrimSpace(lastMod) == "" {
+		sitemapLog.Debug(fmt.Sprintf("Page %s has no lastmod; fetching it.", pageURL))
+		return false
+	}
+	modifiedAt, err := parse.ParseSitemapLastMod(lastMod)
+	if err != nil {
+		sitemapLog.Info(fmt.Sprintf("Page %s has an unparseable lastmod %q; fetching it.", pageURL, lastMod))
+		return false
+	}
+	now := sp.now()
+	if modifiedAt.After(now) {
+		sitemapLog.Info(fmt.Sprintf("Page %s has a future lastmod %s (now %s); fetching it.", pageURL, modifiedAt.Format(time.RFC3339), now.Format(time.RFC3339)))
+		return false
+	}
+	if modifiedAt.After(sp.lastSuccess) {
+		sitemapLog.Debug(fmt.Sprintf("Page %s changed after the last successful crawl (lastmod %s > %s); fetching it.",
+			pageURL, modifiedAt.Format(time.RFC3339), sp.lastSuccess.Format(time.RFC3339)))
+		return false
+	}
+	sitemapLog.Info(fmt.Sprintf("Page %s unchanged since lastmod %s; skipping its download.", pageURL, modifiedAt.Format(time.RFC3339)))
+	return true
 }
 
 // normalizeInScopeURL returns the normalized form of pageURL if it is an
